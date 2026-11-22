@@ -1,11 +1,10 @@
 /**
  * AI Center for Kino
  * Asistente inteligente nativo con kino.ai, biblioteca kino.library,
- * enriquecimiento TMDB, tarjetas interactivas de películas, gestión de listas,
- * historial persistente con storageLarge e integración musical con YTMusic.
+ * enriquecimiento TMDB, integración profunda con YTMusic (canciones con carátula y reproducción),
+ * tarjetas interactivas, gestión de listas, historial persistente con storageLarge.
  */
 
-// Helper seguro para acceder a kino global
 function getKino() {
   return typeof kino !== "undefined" ? kino : null;
 }
@@ -15,7 +14,7 @@ function generateId() {
 }
 
 // ---------------------------------------------------------------------------
-// 1. SERVICIOS DE METADATOS Y TMDB
+// 1. SERVICIOS DE METADATOS: TMDB (Películas y Series)
 // ---------------------------------------------------------------------------
 async function fetchTmdbMovie(query, year) {
   const k = getKino();
@@ -41,7 +40,191 @@ async function fetchTmdbMovie(query, year) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. BIBLIOTECA DEL USUARIO (kino.library)
+// 2. INTEGRACIÓN CON YTMUSIC: Búsqueda y Metadata Oficial
+// ---------------------------------------------------------------------------
+const YT_SEARCH_ENDPOINT = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
+const YT_SEARCH_PARAMS_SONGS = "EgWKAQIIAWoMEA4QChADEAQQCRAF";
+
+async function fetchYTMusicTracks(query) {
+  const q = String(query || "").trim();
+  if (!q) return [];
+
+  const payload = {
+    context: {
+      client: {
+        clientName: "WEB_REMIX",
+        clientVersion: "1.20241118.01.00",
+        hl: "es",
+        gl: "ES"
+      }
+    },
+    query: q,
+    params: YT_SEARCH_PARAMS_SONGS
+  };
+
+  try {
+    const k = getKino();
+    const fetchFn = (k && typeof k.fetch === "function") ? k.fetch.bind(k) : (typeof globalThis["fetch"] === "function" ? globalThis["fetch"] : null);
+    if (!fetchFn) return [];
+
+    const res = await fetchFn(YT_SEARCH_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Origin": "https://music.youtube.com",
+        "Referer": "https://music.youtube.com/"
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!res.ok) return [];
+    const data = await res.json();
+    const sections = data.contents?.tabbedSearchResultsRenderer?.tabs?.[0]?.tabRenderer?.content?.sectionListRenderer?.contents || [];
+    const songs = [];
+
+    for (let s = 0; s < sections.length; s++) {
+      const shelf = sections[s].musicShelfRenderer || sections[s].musicCardShelfRenderer;
+      if (!shelf || !Array.isArray(shelf.contents)) continue;
+
+      for (let i = 0; i < shelf.contents.length; i++) {
+        const r = shelf.contents[i].musicResponsiveListItemRenderer;
+        if (!r) continue;
+
+        const flexCols = r.flexColumns || [];
+        const col0Text = flexCols[0]?.musicResponsiveListItemFlexColumnRenderer?.text;
+        const title = (col0Text?.runs || []).map(function(x) { return x.text; }).join("").trim();
+
+        const col1Runs = flexCols[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs || [];
+        const artistRuns = col1Runs.filter(function(x) {
+          return x.navigationEndpoint?.browseEndpoint?.browseEndpointContextSupportedConfigs?.browseEndpointContextMusicConfig?.pageType === "MUSIC_PAGE_TYPE_ARTIST";
+        });
+        const artists = artistRuns.map(function(x) { return x.text; }).join(", ") || (col1Runs[0]?.text || "Varios Artistas");
+
+        const albumRun = col1Runs.find(function(x) {
+          return x.navigationEndpoint?.browseEndpoint?.browseEndpointContextSupportedConfigs?.browseEndpointContextMusicConfig?.pageType === "MUSIC_PAGE_TYPE_ALBUM";
+        });
+        const album = albumRun ? albumRun.text : "";
+
+        const thumbs = r.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
+        let poster = thumbs.length ? thumbs[thumbs.length - 1].url : null;
+        if (poster) {
+          poster = poster.replace(/=w\d+-h\d+/, "=w544-h544");
+        }
+
+        const videoId = r.playlistItemData?.videoId ||
+          r.overlay?.musicItemThumbnailOverlayRenderer?.content?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId ||
+          col0Text?.runs?.[0]?.navigationEndpoint?.watchEndpoint?.videoId;
+
+        if (title && (videoId || poster)) {
+          songs.push({
+            title: title,
+            artist: artists,
+            album: album,
+            poster: poster,
+            videoId: videoId || ""
+          });
+        }
+        if (songs.length >= 3) break;
+      }
+      if (songs.length >= 3) break;
+    }
+    return songs;
+  } catch (_) {}
+  return [];
+}
+
+// ---------------------------------------------------------------------------
+// 3. EXTRACTORES DE CONTENIDO (Música vs. Películas)
+// ---------------------------------------------------------------------------
+function isMusicIntent(text) {
+  const t = (text || "").toLowerCase();
+  const musicKeywords = [
+    "música", "musica", "canción", "cancion", "canciones", "soundtrack", "soundtracks",
+    "banda sonora", "bandas sonoras", "tema musical", "ost", "compositor", "compositores",
+    "álbum", "album", "cantante", "escuchar", "ytmusic", "youtube music", "disco", "melodía", "melodia",
+    "hans zimmer", "john williams", "morricone", "vangelis"
+  ];
+  return musicKeywords.some(function(k) { return t.includes(k); });
+}
+
+async function enrichRecommendedMusic(text, userQuery) {
+  const songs = [];
+  const titlesSeen = new Set();
+
+  // 1. Extraer patrones de canciones citadas entre comillas
+  const regex = /["“]([^"”]+)["”](?:\s*(?:de|by|por|-)\s*([a-zA-Z0-9\s\.\,\&]+))?/gi;
+  let match;
+
+  while ((match = regex.exec(text)) !== null) {
+    const rawSong = match[1].trim();
+    const artist = (match[2] || "").trim();
+    const searchTarget = artist ? (rawSong + " " + artist) : rawSong;
+
+    if (rawSong.length > 1 && !titlesSeen.has(rawSong.toLowerCase())) {
+      titlesSeen.add(rawSong.toLowerCase());
+      const results = await fetchYTMusicTracks(searchTarget);
+      if (results.length > 0) {
+        songs.push(results[0]);
+      } else {
+        songs.push({
+          title: rawSong,
+          artist: artist || "YouTube Music",
+          album: "",
+          poster: null,
+          videoId: ""
+        });
+      }
+    }
+    if (songs.length >= 3) break;
+  }
+
+  // 2. Si no encontró entre comillas, buscar con la intención general del usuario
+  if (songs.length === 0 && userQuery) {
+    const cleanQ = userQuery.replace(/recomienda(me)?|dime|canciones|musica|música|de|sobre/gi, "").trim();
+    if (cleanQ.length > 2) {
+      const results = await fetchYTMusicTracks(cleanQ);
+      for (let j = 0; j < Math.min(results.length, 3); j++) {
+        songs.push(results[j]);
+      }
+    }
+  }
+
+  return songs;
+}
+
+async function enrichRecommendedMovies(text) {
+  const movies = [];
+  const regex = /(?:película|películas|film|obra|cinta|título|ve|mira)?[:\s]*["“]([^"”]+)["”](?:\s*\((\d{4})\))?/gi;
+  let match;
+  const titlesSeen = new Set();
+
+  while ((match = regex.exec(text)) !== null) {
+    const rawTitle = match[1].trim();
+    const year = match[2] || null;
+    if (rawTitle.length > 1 && !titlesSeen.has(rawTitle.toLowerCase())) {
+      titlesSeen.add(rawTitle.toLowerCase());
+      const meta = await fetchTmdbMovie(rawTitle, year);
+      if (meta) {
+        movies.push(meta);
+      } else {
+        movies.push({
+          title: rawTitle,
+          year: year || "",
+          overview: "Recomendada por AI Center",
+          rating: null,
+          poster: null,
+          tmdbId: null
+        });
+      }
+    }
+    if (movies.length >= 3) break;
+  }
+  return movies;
+}
+
+// ---------------------------------------------------------------------------
+// 4. CONTEXTO DE BIBLIOTECA (kino.library) Y PERSISTENCIA (storageLarge)
 // ---------------------------------------------------------------------------
 async function getUserLibraryContext() {
   const k = getKino();
@@ -66,9 +249,6 @@ async function getUserLibraryContext() {
   return context;
 }
 
-// ---------------------------------------------------------------------------
-// 3. PERSISTENCIA CON storageLarge (16 MB)
-// ---------------------------------------------------------------------------
 async function getSessionsIndex() {
   const k = getKino();
   if (!k || !k.storage || !k.storage.get) return [];
@@ -162,7 +342,7 @@ async function getMusicPreferences() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. MOTOR INTELIGENTE (kino.ai)
+// 5. MOTOR DE IA (kino.ai)
 // ---------------------------------------------------------------------------
 async function askAI(prompt, system, isJson) {
   const k = getKino();
@@ -181,39 +361,6 @@ async function askAI(prompt, system, isJson) {
 }
 
 // ---------------------------------------------------------------------------
-// 5. EXTRACTOR Y ENRIQUECEDOR DE PELÍCULAS CON TMDB
-// ---------------------------------------------------------------------------
-async function enrichRecommendedMovies(text) {
-  const movies = [];
-  const regex = /(?:película|películas|film|obra|cinta|título|ve|mira)?[:\s]*["“]([^"”]+)["”](?:\s*\((\d{4})\))?/gi;
-  let match;
-  const titlesSeen = new Set();
-
-  while ((match = regex.exec(text)) !== null) {
-    const rawTitle = match[1].trim();
-    const year = match[2] || null;
-    if (rawTitle.length > 1 && !titlesSeen.has(rawTitle.toLowerCase())) {
-      titlesSeen.add(rawTitle.toLowerCase());
-      const meta = await fetchTmdbMovie(rawTitle, year);
-      if (meta) {
-        movies.push(meta);
-      } else {
-        movies.push({
-          title: rawTitle,
-          year: year || "",
-          overview: "Recomendada por AI Center",
-          rating: null,
-          poster: null,
-          tmdbId: null
-        });
-      }
-    }
-    if (movies.length >= 4) break;
-  }
-  return movies;
-}
-
-// ---------------------------------------------------------------------------
 // 6. EXPORTS DE CONTRATO KINO
 // ---------------------------------------------------------------------------
 export async function home() {
@@ -221,21 +368,17 @@ export async function home() {
     {
       type: "hero",
       title: "AI Center",
-      subtitle: "Tu centro inteligente de cine, listas y música",
+      subtitle: "Centro inteligente de cine, listas y música con YTMusic",
       action: { screen: { route: "main" } }
     }
   ];
 }
 
-// ---------------------------------------------------------------------------
-// 7. VISTAS SCREEN (Scaffold + NavigationBar)
-// ---------------------------------------------------------------------------
 export async function screen(args) {
   const state = (args && args.state) || {};
-  const currentTab = state.currentTab || "chat"; // "chat" | "lists" | "music" | "sessions"
+  const currentTab = state.currentTab || "chat";
   const currentSessionId = state.currentSessionId || "default";
 
-  // Cargar mensajes si no están en state
   let messages = Array.isArray(state.messages) ? state.messages : [];
   if (messages.length === 0 && currentTab === "chat") {
     messages = await getSessionMessages(currentSessionId);
@@ -294,14 +437,13 @@ export async function screen(args) {
 }
 
 // ---------------------------------------------------------------------------
-// 8. RENDERIZADO DE TABS
+// 7. RENDERIZADO DE PANTALLAS
 // ---------------------------------------------------------------------------
 
 // TAB: CHAT
 function renderChatTab(messages, loading) {
   const listItems = [];
 
-  // Bienvenida inicial si no hay mensajes
   if (messages.length === 0) {
     listItems.push({
       type: "Column",
@@ -322,7 +464,7 @@ function renderChatTab(messages, loading) {
         },
         {
           type: "Text",
-          text: "Tu asistente cinéfilo inteligente. Pide recomendaciones, juega trivia, crea listas o descubre películas afines a tus gustos.",
+          text: "Tu asistente multimedia. Pide recomendaciones de cine o música (con reproducción en YTMusic), juega trivia o descubre qué ver hoy.",
           style: "body",
           color: "muted",
           textAlign: "center"
@@ -340,6 +482,13 @@ function renderChatTab(messages, loading) {
             },
             {
               type: "Button",
+              label: "🎵 Recomiéndame Música",
+              variant: "secondary",
+              icon: "music",
+              onTap: { event: "quick_music_prompt", arg: "Recomiéndame 3 temas musicales épicos de películas para escuchar en YouTube Music" }
+            },
+            {
+              type: "Button",
               label: "🎲 Jugar Trivia",
               variant: "secondary",
               onTap: { event: "play_trivia" }
@@ -349,12 +498,6 @@ function renderChatTab(messages, loading) {
               label: "🎬 Joyas Sci-Fi",
               variant: "secondary",
               onTap: { event: "quick_prompt", arg: "Recomiéndame 3 joyas ocultas de ciencia ficción con giro de guion" }
-            },
-            {
-              type: "Button",
-              label: "🍿 Cine en Pareja",
-              variant: "secondary",
-              onTap: { event: "quick_prompt", arg: "Recomienda películas ligeras y entretenidas para ver un sábado por la noche" }
             }
           ]
         }
@@ -362,7 +505,6 @@ function renderChatTab(messages, loading) {
     });
   }
 
-  // Renderizar mensajes del thread
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     const isUser = msg.role === "user";
@@ -378,16 +520,12 @@ function renderChatTab(messages, loading) {
             variant: "filled",
             padding: 12,
             children: [
-              {
-                type: "Text",
-                text: msg.text || ""
-              }
+              { type: "Text", text: msg.text || "" }
             ]
           }
         ]
       });
     } else {
-      // Mensaje de la IA
       const cardChildren = [
         {
           type: "Row",
@@ -403,6 +541,23 @@ function renderChatTab(messages, loading) {
         }
       ];
 
+      // Tarjetas de canciones de YouTube Music
+      if (Array.isArray(msg.songs) && msg.songs.length > 0) {
+        cardChildren.push({ type: "Divider" });
+        cardChildren.push({
+          type: "Row",
+          gap: 8,
+          children: [
+            { type: "Icon", name: "music", color: "primary" },
+            { type: "Text", text: "Pistas encontradas en YouTube Music (toca para reproducir):", style: "caption", bold: true }
+          ]
+        });
+
+        for (let s = 0; s < msg.songs.length; s++) {
+          cardChildren.push(renderSongCard(msg.songs[s], i + "_s_" + s));
+        }
+      }
+
       // Tarjetas de películas recomendadas
       if (Array.isArray(msg.movies) && msg.movies.length > 0) {
         cardChildren.push({ type: "Divider" });
@@ -414,8 +569,7 @@ function renderChatTab(messages, loading) {
         });
 
         for (let m = 0; m < msg.movies.length; m++) {
-          const mov = msg.movies[m];
-          cardChildren.push(renderMovieCard(mov, i + "_" + m));
+          cardChildren.push(renderMovieCard(msg.movies[m], i + "_m_" + m));
         }
       }
 
@@ -451,7 +605,7 @@ function renderChatTab(messages, loading) {
               gap: 8,
               children: [
                 { type: "Icon", name: "magic", color: "primary" },
-                { type: "Text", text: "AI Center está pensando y consultando fichas en TMDB...", style: "caption" }
+                { type: "Text", text: "AI Center está consultando recomendaciones y metadata...", style: "caption" }
               ]
             }
           ]
@@ -481,7 +635,7 @@ function renderChatTab(messages, loading) {
           {
             type: "TextField",
             key: "prompt",
-            hintText: "Pregunta a AI Center, pide recomendaciones o listas...",
+            hintText: "Pide recomendaciones de cine o música (ej: Hans Zimmer, Sci-Fi)...",
             onSubmitted: "send_message",
             trailingIcon: "send",
             trailingLabel: "Enviar",
@@ -490,7 +644,7 @@ function renderChatTab(messages, loading) {
           },
           {
             type: "Text",
-            text: "IA nativa de Kino · TMDB · Historial en storageLarge",
+            text: "IA de Kino · Conexión directa a YTMusic · TMDB · storageLarge",
             style: "caption",
             color: "muted",
             textAlign: "center"
@@ -501,7 +655,108 @@ function renderChatTab(messages, loading) {
   };
 }
 
-// TARJETA DE PELÍCULA ENRIQUECIDA CON TMDB Y ACCIONES
+// TARJETA DE CANCIÓN CONECTADA A YTMUSIC
+function renderSongCard(song, keySuffix) {
+  const queryStr = (song.artist ? (song.artist + " - ") : "") + song.title;
+
+  const rowChildren = [];
+
+  if (song.poster) {
+    rowChildren.push({
+      type: "Image",
+      url: song.poster,
+      aspect: "1:1",
+      width: 80
+    });
+  }
+
+  const details = [
+    {
+      type: "Row",
+      gap: 8,
+      children: [
+        { type: "Badge", text: "🎵 YTMusic", color: "primary" }
+      ]
+    },
+    {
+      type: "Text",
+      text: song.title,
+      bold: true
+    },
+    {
+      type: "Text",
+      text: (song.artist || "YouTube Music") + (song.album ? (" • " + song.album) : ""),
+      style: "caption",
+      color: "muted"
+    },
+    {
+      type: "Row",
+      wrap: true,
+      gap: 8,
+      children: [
+        {
+          type: "Button",
+          label: "Reproducir en YTMusic",
+          icon: "music",
+          variant: "primary",
+          onTap: {
+            go: {
+              plugin: {
+                repo: "JuanDEVYT/YTMusic_plugin",
+                query: queryStr
+              }
+            }
+          }
+        },
+        {
+          type: "Button",
+          label: "Buscar en Kino",
+          icon: "search",
+          variant: "secondary",
+          onTap: {
+            go: {
+              search: {
+                q: queryStr,
+                scope: "all"
+              }
+            }
+          }
+        }
+      ]
+    }
+  ];
+
+  rowChildren.push({
+    type: "Column",
+    flex: 1,
+    gap: 4,
+    children: details
+  });
+
+  return {
+    type: "Card",
+    key: "song_card_" + keySuffix,
+    variant: "filled",
+    padding: 8,
+    onTap: {
+      go: {
+        plugin: {
+          repo: "JuanDEVYT/YTMusic_plugin",
+          query: queryStr
+        }
+      }
+    },
+    children: [
+      {
+        type: "Row",
+        gap: 12,
+        children: rowChildren
+      }
+    ]
+  };
+}
+
+// TARJETA DE PELÍCULA ENRIQUECIDA CON TMDB
 function renderMovieCard(mov, keySuffix) {
   const rowChildren = [];
 
@@ -521,7 +776,7 @@ function renderMovieCard(mov, keySuffix) {
       children: [
         { type: "Text", text: mov.title, bold: true },
         mov.year ? { type: "Text", text: "(" + mov.year + ")", style: "caption", color: "muted" } : null,
-        mov.rating ? { type: "Badge", label: "★ " + mov.rating, color: "primary" } : null
+        mov.rating ? { type: "Badge", text: "★ " + mov.rating, color: "primary" } : null
       ].filter(Boolean)
     }
   ];
@@ -534,7 +789,6 @@ function renderMovieCard(mov, keySuffix) {
     });
   }
 
-  // Botones de acción directa
   const actionsRow = [];
   if (mov.tmdbId) {
     actionsRow.push({
@@ -572,18 +826,16 @@ function renderMovieCard(mov, keySuffix) {
 
   actionsRow.push({
     type: "Button",
-    label: "+ Guardar en lista",
-    icon: "bookmark",
+    label: "BSO en YTMusic",
+    icon: "music",
     variant: "text",
     onTap: {
-      event: "add_to_list",
-      arg: JSON.stringify({
-        title: mov.title,
-        year: mov.year,
-        poster: mov.poster,
-        rating: mov.rating,
-        tmdbId: mov.tmdbId
-      })
+      go: {
+        plugin: {
+          repo: "JuanDEVYT/YTMusic_plugin",
+          query: mov.title + " soundtrack"
+        }
+      }
     }
   });
 
@@ -650,13 +902,13 @@ function renderListsTab(customLists) {
       padding: 16,
       children: [
         { type: "Text", text: "No tienes listas creadas aún.", textAlign: "center" },
-        { type: "Text", text: "Pídele a AI Center en el chat: 'Crea una lista llamada Joyas Ocultas'", style: "caption", color: "muted", textAlign: "center" }
+        { type: "Text", text: "Pídele a AI Center en el chat: \"Crea una lista llamada Joyas Ocultas\"", style: "caption", color: "muted", textAlign: "center" }
       ]
     });
   } else {
     for (let i = 0; i < customLists.length; i++) {
       const list = customLists[i];
-      const movieChips = (list.movies || []).map(function(m, idx) {
+      const movieChips = (list.movies || []).map(function(m) {
         return {
           type: "Button",
           label: m.title + (m.year ? " (" + m.year + ")" : ""),
@@ -736,7 +988,7 @@ function renderMusicTab(musicPrefs) {
         gap: 4,
         children: [
           { type: "Text", text: "Tus Gustos Musicales & Bandas Sonoras", style: "h3" },
-          { type: "Text", text: "Integración con tu plugin YTMusic. Toca cualquier elemento para reproducir en YouTube Music.", style: "caption", color: "muted" }
+          { type: "Text", text: "Integración profunda con tu plugin YouTube Music. Toca cualquier canción para reproducir.", style: "caption", color: "muted" }
         ]
       },
       {
@@ -744,28 +996,7 @@ function renderMusicTab(musicPrefs) {
         variant: "filled",
         padding: 16,
         children: [
-          { type: "Text", text: "Géneros Cinéfilos Favoritos", bold: true },
-          {
-            type: "Row",
-            wrap: true,
-            gap: 8,
-            children: genres.map(function(g) {
-              return {
-                type: "Button",
-                label: g,
-                variant: "secondary",
-                onTap: { go: { search: { q: g + " music", scope: "all" } } }
-              };
-            })
-          }
-        ]
-      },
-      {
-        type: "Card",
-        variant: "filled",
-        padding: 16,
-        children: [
-          { type: "Text", text: "Compositores de Cine Recomendados", bold: true },
+          { type: "Text", text: "Temas y Compositores Recomendados", bold: true },
           {
             type: "Row",
             wrap: true,
@@ -776,7 +1007,34 @@ function renderMusicTab(musicPrefs) {
                 label: a,
                 icon: "music",
                 variant: "secondary",
-                onTap: { go: { search: { q: a + " soundtrack", scope: "all" } } }
+                onTap: {
+                  event: "quick_music_prompt",
+                  arg: "Recomiéndame 3 canciones o bandas sonoras destacadas de " + a
+                }
+              };
+            })
+          }
+        ]
+      },
+      {
+        type: "Card",
+        variant: "filled",
+        padding: 16,
+        children: [
+          { type: "Text", text: "Géneros Musicales de Cine", bold: true },
+          {
+            type: "Row",
+            wrap: true,
+            gap: 8,
+            children: genres.map(function(g) {
+              return {
+                type: "Button",
+                label: g,
+                variant: "secondary",
+                onTap: {
+                  event: "quick_music_prompt",
+                  arg: "Recomienda 3 canciones del género " + g + " para escuchar en YouTube Music"
+                }
               };
             })
           }
@@ -787,7 +1045,7 @@ function renderMusicTab(musicPrefs) {
         variant: "outlined",
         padding: 16,
         children: [
-          { type: "Text", text: "Generadores de Música con IA", bold: true },
+          { type: "Text", text: "Generadores Musicales con IA", bold: true },
           {
             type: "Row",
             wrap: true,
@@ -795,16 +1053,16 @@ function renderMusicTab(musicPrefs) {
             children: [
               {
                 type: "Button",
-                label: "🎵 Recomiéndame un Soundtrack Épico",
+                label: "🎵 Soundtracks de Ciencia Ficción",
                 variant: "primary",
                 onTap: {
                   event: "quick_music_prompt",
-                  arg: "Recomiéndame 3 bandas sonoras épicas de películas que debería escuchar en YouTube Music"
+                  arg: "Recomiéndame 3 temas musicales épicos de películas de ciencia ficción para escuchar en YouTube Music"
                 }
               },
               {
                 type: "Button",
-                label: "🎧 Música para estudiar (Cine Instrumental)",
+                label: "🎧 Música para estudiar (Instrumental)",
                 variant: "secondary",
                 onTap: {
                   event: "quick_music_prompt",
@@ -915,7 +1173,7 @@ function renderSessionsTab(sessionsIndex, currentSessionId) {
 }
 
 // ---------------------------------------------------------------------------
-// 9. GESTIÓN DE EVENTOS (screenEvent)
+// 8. GESTIÓN DE EVENTOS (screenEvent)
 // ---------------------------------------------------------------------------
 export async function screenEvent(args) {
   const name = args.name || "";
@@ -925,7 +1183,6 @@ export async function screenEvent(args) {
   const currentTab = state.currentTab || "chat";
   const currentSessionId = state.currentSessionId || "default";
 
-  // Cambio de pestaña en NavigationBar
   if (name === "nav_change") {
     const nextTab = value || arg || "chat";
     return {
@@ -933,7 +1190,6 @@ export async function screenEvent(args) {
     };
   }
 
-  // Nuevo chat
   if (name === "new_chat") {
     const newId = generateId();
     return {
@@ -947,7 +1203,6 @@ export async function screenEvent(args) {
     };
   }
 
-  // Cargar sesión guardada
   if (name === "load_session") {
     const sid = arg;
     const msgs = await getSessionMessages(sid);
@@ -962,7 +1217,6 @@ export async function screenEvent(args) {
     };
   }
 
-  // Borrar sesión
   if (name === "delete_session") {
     const sid = arg;
     let idx = await getSessionsIndex();
@@ -982,30 +1236,6 @@ export async function screenEvent(args) {
     };
   }
 
-  // Guardar película en lista personalizada
-  if (name === "add_to_list") {
-    try {
-      const movieData = JSON.parse(arg);
-      const lists = await getCustomLists();
-      if (lists.length > 0) {
-        if (!lists[0].movies) lists[0].movies = [];
-        const exists = lists[0].movies.some(function(m) { return m.title === movieData.title; });
-        if (!exists) {
-          lists[0].movies.push(movieData);
-          await saveCustomLists(lists);
-          return {
-            state: Object.assign({}, state, { customLists: lists }),
-            toast: "Añadida a \"" + lists[0].name + "\""
-          };
-        } else {
-          return { toast: "Ya estaba en la lista" };
-        }
-      }
-    } catch (_) {}
-    return { toast: "No se pudo añadir a la lista" };
-  }
-
-  // Borrar lista
   if (name === "delete_list") {
     let lists = await getCustomLists();
     lists = lists.filter(function(l) { return l.id !== arg && l.name !== arg; });
@@ -1033,7 +1263,7 @@ export async function screenEvent(args) {
 
     let messages = Array.isArray(state.messages) ? state.messages.slice() : [];
     messages.push({ role: "user", text: "🎯 ¿Qué veo hoy?" });
-    messages.push({ role: "assistant", text: textToShow, movies: movies });
+    messages.push({ role: "assistant", text: textToShow, movies: movies, songs: [] });
 
     await persistCurrentSession(currentSessionId, messages);
 
@@ -1052,7 +1282,7 @@ export async function screenEvent(args) {
 
     let messages = Array.isArray(state.messages) ? state.messages.slice() : [];
     messages.push({ role: "user", text: "🎲 Jugar Trivia de Cine" });
-    messages.push({ role: "assistant", text: triviaText, movies: [] });
+    messages.push({ role: "assistant", text: triviaText, movies: [], songs: [] });
 
     await persistCurrentSession(currentSessionId, messages);
 
@@ -1061,16 +1291,17 @@ export async function screenEvent(args) {
     };
   }
 
-  // Prompts rápidos de música
+  // Prompts rápidos de música (consultan YouTube Music directamente)
   if (name === "quick_music_prompt") {
     const userPrompt = arg;
-    const answer = await askAI(userPrompt, "Eres un experto en bandas sonoras de cine y su conexión con YouTube Music.");
-    const text = answer || "Aquí tienes 3 bandas sonoras imprescindibles:\n1. \"Interstellar\" de Hans Zimmer\n2. \"The Lord of the Rings\" de Howard Shore\n3. \"Blade Runner\" de Vangelis.\nPuedes buscarlas directamente en YTMusic con los botones de arriba.";
-    const movies = await enrichRecommendedMovies(text);
+    const sysPrompt = "Eres un especialista musical conectado a YouTube Music. Recomienda de 2 a 3 canciones o bandas sonoras. Escribe cada título de canción entre comillas y el artista, ej: \"Cornfield Chase\" de Hans Zimmer.";
+    const answer = await askAI(userPrompt, sysPrompt);
+    const text = answer || "Aquí tienes excelentes temas musicales:\n- \"Time\" de Hans Zimmer\n- \"Cornfield Chase\" de Hans Zimmer\n- \"Tears in Rain\" de Vangelis";
+    const songs = await enrichRecommendedMusic(text, userPrompt);
 
     let messages = Array.isArray(state.messages) ? state.messages.slice() : [];
     messages.push({ role: "user", text: userPrompt });
-    messages.push({ role: "assistant", text: text, movies: movies });
+    messages.push({ role: "assistant", text: text, songs: songs, movies: [] });
 
     await persistCurrentSession(currentSessionId, messages);
 
@@ -1079,7 +1310,7 @@ export async function screenEvent(args) {
     };
   }
 
-  // Prompt rápido
+  // Prompt rápido de cine
   if (name === "quick_prompt") {
     const userPrompt = arg;
     const answer = await askAI(userPrompt, "Eres AI Center, asistente cinéfilo experto. Pon los títulos de películas recomendadas entre comillas con su año, ej: \"Matrix\" (1999).");
@@ -1088,7 +1319,7 @@ export async function screenEvent(args) {
 
     let messages = Array.isArray(state.messages) ? state.messages.slice() : [];
     messages.push({ role: "user", text: userPrompt });
-    messages.push({ role: "assistant", text: text, movies: movies });
+    messages.push({ role: "assistant", text: text, movies: movies, songs: [] });
 
     await persistCurrentSession(currentSessionId, messages);
 
@@ -1097,7 +1328,7 @@ export async function screenEvent(args) {
     };
   }
 
-  // Enviar mensaje del usuario
+  // Enviar mensaje del usuario con detección inteligente de Cine vs. Música
   if (name === "send_message") {
     const userText = (value && typeof value === "object" && value.prompt) ? value.prompt.trim() : (state.inputs && state.inputs.prompt ? state.inputs.prompt.trim() : (typeof value === "string" ? value.trim() : ""));
     if (!userText) return null;
@@ -1105,25 +1336,44 @@ export async function screenEvent(args) {
     let messages = Array.isArray(state.messages) ? state.messages.slice() : [];
     messages.push({ role: "user", text: userText });
 
-    const libraryCtx = await getUserLibraryContext();
-    const lists = await getCustomLists();
+    const isMusic = isMusicIntent(userText);
 
-    let sysPrompt = "Eres AI Center, asistente cinéfilo experto de Kino. Responde de forma amable, analítica y entusiasta. " +
-      "Cuando recomiendes películas, menciona sus títulos entre comillas con su año, por ejemplo: \"Interestelar\" (2014) o \"El Padrino\" (1972).";
+    if (isMusic) {
+      // Flujo de Música & YouTube Music
+      const sysPrompt = "Eres AI Center especializado en música y bandas sonoras conectado a YouTube Music. " +
+        "Recomienda de 2 a 3 canciones o pistas específicas. Escribe siempre cada tema musical entre comillas y nombra a su compositor o artista (ejemplo: \"Cornfield Chase\" de Hans Zimmer o \"Starboy\" de The Weeknd).";
 
-    if (libraryCtx.watchedTitles.length > 0) {
-      sysPrompt += " Películas vistas recientemente por el usuario: " + libraryCtx.watchedTitles.slice(0, 8).join(", ") + ".";
+      const aiResponse = await askAI(userText, sysPrompt);
+      const finalAiText = aiResponse || "Aquí tienes algunas recomendaciones musicales disponibles en YouTube Music: \"Time\" de Hans Zimmer y \"Day One\" de Hans Zimmer.";
+      const songs = await enrichRecommendedMusic(finalAiText, userText);
+
+      messages.push({
+        role: "assistant",
+        text: finalAiText,
+        songs: songs,
+        movies: []
+      });
+    } else {
+      // Flujo de Cine & Películas
+      const libraryCtx = await getUserLibraryContext();
+      let sysPrompt = "Eres AI Center, asistente cinéfilo experto de Kino. Responde de forma analítica y entusiasta. " +
+        "Cuando recomiendes películas, menciona sus títulos entre comillas con su año, por ejemplo: \"Interestelar\" (2014) o \"El Padrino\" (1972).";
+
+      if (libraryCtx.watchedTitles.length > 0) {
+        sysPrompt += " Películas vistas por el usuario: " + libraryCtx.watchedTitles.slice(0, 8).join(", ") + ".";
+      }
+
+      const aiResponse = await askAI(userText, sysPrompt);
+      const finalAiText = aiResponse || "Te recomiendo explorar \"Interestelar\" (2014) y \"Dune\" (2021). Son dos obras que destacan por su dirección y diseño sonoro.";
+      const movies = await enrichRecommendedMovies(finalAiText);
+
+      messages.push({
+        role: "assistant",
+        text: finalAiText,
+        movies: movies,
+        songs: []
+      });
     }
-
-    const aiResponse = await askAI(userText, sysPrompt);
-    const finalAiText = aiResponse || "Te recomiendo explorar \"Interestelar\" (2014) y \"Dune\" (2021). Son dos obras que destacan por su diseño sonoro y profundidad temática.";
-    const movies = await enrichRecommendedMovies(finalAiText);
-
-    messages.push({
-      role: "assistant",
-      text: finalAiText,
-      movies: movies
-    });
 
     await persistCurrentSession(currentSessionId, messages);
 
@@ -1140,7 +1390,7 @@ export async function screenEvent(args) {
 }
 
 // ---------------------------------------------------------------------------
-// 10. HELPER DE PERSISTENCIA storageLarge
+// 9. PERSISTENCIA storageLarge
 // ---------------------------------------------------------------------------
 async function persistCurrentSession(sessionId, messages) {
   await saveSessionMessages(sessionId, messages);

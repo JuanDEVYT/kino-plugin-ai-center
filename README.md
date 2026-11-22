@@ -6,9 +6,11 @@
 
 ## Características principales
 
-1. **Chat Cinéfilo Inteligente:**
-   - Recomendaciones con fichas enriquecidas (póster oficial de TMDB, año de estreno, calificación con estrellas ⭐ y sinopsis).
-   - Botón directo **Ver en Kino** (`titleByIds`) y **Buscar fuentes** en todos tus plugins.
+1. **Chat Cinéfilo y Musical Inteligente:**
+   - Detección automática de intención: responde con películas o música según lo que pidas.
+   - **Tarjetas de Películas:** Póster TMDB (2:3), año, rating ⭐, sinopsis y botón directo *Ver en Kino*.
+   - **Tarjetas de Canciones (YouTube Music):** Carátula oficial en alta definición, artista, álbum, badge *🎵 YTMusic* y botón de reproducción directa.
+   - **Acción al tocar la card:** Comunica directamente con el plugin `JuanDEVYT/YTMusic_plugin` abriendo la búsqueda preconfigurada y lista para reproducir.
 2. **Selector al azar según tus gustos ("🎯 ¿Qué veo hoy?"):**
    - Analiza tu historial real de películas vistas (`kino.library.watched`) para recomendarte una joya afín a tus preferencias personales.
 3. **Mis Listas Personalizadas:**

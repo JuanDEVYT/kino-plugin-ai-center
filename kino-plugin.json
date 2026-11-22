@@ -1,7 +1,7 @@
 {
   "id": "ai-center",
   "name": "AI Center",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "apiVersion": 20,
   "entry": "plugin.js",
   "icon": "icon.png",
@@ -23,7 +23,10 @@
   ],
   "hosts": [
     "api.themoviedb.org",
-    "image.tmdb.org"
+    "image.tmdb.org",
+    "music.youtube.com",
+    "lh3.googleusercontent.com",
+    "i.ytimg.com"
   ],
   "screen": {
     "label": "AI Center",
