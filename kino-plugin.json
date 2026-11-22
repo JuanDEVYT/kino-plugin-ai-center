@@ -1,0 +1,49 @@
+{
+  "id": "ai-center",
+  "name": "AI Center",
+  "version": "1.2.0",
+  "apiVersion": 20,
+  "entry": "plugin.js",
+  "icon": "icon.png",
+  "color": "#7F00FF",
+  "description": "Centro de Inteligencia Artificial para Kino: chat cinéfilo inteligente, tarjetas interactivas de películas con pósters de TMDB, gestión de listas, selector por gustos e integración musical con YTMusic.",
+  "author": "JuanDEVYT",
+  "creator": "JuanDEVYT",
+  "categories": [
+    "utilities"
+  ],
+  "capabilities": [
+    "screen",
+    "ai",
+    "library",
+    "storageLarge"
+  ],
+  "recommends": [
+    "JuanDEVYT/YTMusic_plugin"
+  ],
+  "hosts": [
+    "api.themoviedb.org",
+    "image.tmdb.org"
+  ],
+  "screen": {
+    "label": "AI Center",
+    "labelEn": "AI Center",
+    "icon": "magic"
+  },
+  "theme": {
+    "accent": "#7F00FF",
+    "onAccent": "#FFFFFF",
+    "background": "#0B0914",
+    "surface": "#141124",
+    "highlight": "#00F2FE"
+  },
+  "settings": [
+    {
+      "key": "enableYTMusic",
+      "label": "Integración con YTMusic",
+      "type": "toggle",
+      "default": true,
+      "hint": "Activa sección musical y bandas sonoras con YTMusic"
+    }
+  ]
+}
