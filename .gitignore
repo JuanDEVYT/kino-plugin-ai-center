@@ -3,3 +3,4 @@ node_modules/
 *.log
 .kino-shared.json
 .kino-storage.json
+.kino-cookies.json
